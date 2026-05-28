@@ -8,7 +8,7 @@ LOGNAME="${LOGNAME:-$USER}"
 export HOME USER LOGNAME
 
 # ════════════════════════════════════════════════════════════════
-#  WINDOWS VM TOOL v26
+#  WINBOX
 #  LLVM 16 via apt (không dùng external repo)
 #  Rootless: toàn bộ libs build từ source (zlib/libffi/pixman/glib/libslirp)
 #  aria2: cài qua conda nếu có, fallback wget static binary, fallback wget
@@ -18,18 +18,82 @@ export HOME USER LOGNAME
 #  NEW: Tự động skip build nếu QEMU đã tồn tại (--rebuild để build lại)
 #
 #  Cách dùng:
-#    bash winv24.sh                          # chế độ interactive như cũ
-#    bash winv24.sh --auto --win2012         # auto, Windows Server 2012 R2
-#    bash winv24.sh --auto --win2022         # auto, Windows Server 2022
-#    bash winv24.sh --auto --win11           # auto, Windows 11 LTSB
-#    bash winv24.sh --auto --win10ltsb       # auto, Windows 10 LTSB 2015
-#    bash winv24.sh --auto --win10ltsc       # auto, Windows 10 LTSC 2023
-#    bash winv24.sh --auto --win2012 --rdp   # auto + mở tunnel RDP
+#    bash winbox                          # chế độ interactive như cũ
+#    bash winbox --auto --win2012         # auto, Windows Server 2012 R2
+#    bash winbox --auto --win2022         # auto, Windows Server 2022
+#    bash winbox --auto --win11           # auto, Windows 11 LTSB
+#    bash winbox --auto --win10ltsb       # auto, Windows 10 LTSB 2015
+#    bash winbox --auto --win10ltsc       # auto, Windows 10 LTSC 2023
+#    bash winbox --auto --win2012 --rdp   # auto + mở tunnel RDP
 # ════════════════════════════════════════════════════════════════
 
 # ── MÀU SẮC ────────────────────────────────────────────────────
 R='\033[1;31m'; G='\033[1;32m'; Y='\033[1;33m'
 B='\033[1;34m'; C='\033[1;36m'; W='\033[0m'
+
+
+# ════════════════════════════════════════════════════════════════
+#  WINBOX UI  ·  3 phases: Processing / Downloading / Launching
+# ════════════════════════════════════════════════════════════════
+_WB_PHASE="" ; _WB_LOG="" ; _WB_SPIN_PID="" 
+_WB_LOG_DIR="$(mktemp -d /tmp/winbox-XXXXXX)"
+
+_wb_tty(){ printf "%b" "$*" >/dev/tty 2>/dev/null || true; }
+
+_wb_spin_loop(){
+    local label="$1" i=0
+    local sp="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    while true; do
+        _wb_tty "\r  \033[36m${sp:$((i%10)):1}\033[0m  ${label}\033[K"
+        sleep 0.12; (( i++ )) 2>/dev/null || i=0
+    done
+}
+
+_phase_begin(){
+    _WB_PHASE="$1"
+    _WB_LOG="$_WB_LOG_DIR/${1// /_}.log"; :>"$_WB_LOG"
+    exec 8>&1 9>&2 1>>"$_WB_LOG" 2>>"$_WB_LOG"
+    _wb_spin_loop "$1" & _WB_SPIN_PID=$!
+}
+
+_phase_end(){
+    if [[ -n "$_WB_SPIN_PID" ]]; then
+        kill "$_WB_SPIN_PID" 2>/dev/null
+        wait "$_WB_SPIN_PID" 2>/dev/null || true
+        _WB_SPIN_PID=""
+    fi
+    { exec 1>&8 8>&- 2>&9 9>&-; } 2>/dev/null || true
+    _wb_tty "\r  \033[32m✔\033[0m  ${_WB_PHASE}\033[K\n"
+    _WB_PHASE=""
+}
+
+_phase_fail(){
+    if [[ -n "$_WB_SPIN_PID" ]]; then
+        kill "$_WB_SPIN_PID" 2>/dev/null
+        wait "$_WB_SPIN_PID" 2>/dev/null || true
+        _WB_SPIN_PID=""
+    fi
+    { exec 1>&8 8>&- 2>&9 9>&-; } 2>/dev/null || true
+    _wb_tty "\r  \033[31m✘\033[0m  ${_WB_PHASE}\033[K\n\n"
+    _wb_tty "  \033[90m── error log ──────────────────────────────────\033[0m\n"
+    local _l
+    while IFS= read -r _l; do
+        [[ -z "$_l" ]] && continue
+        _wb_tty "  \033[31m│\033[0m $_l\n"
+    done < <(grep -v '^[[:space:]]*$' "$_WB_LOG" 2>/dev/null | tail -60)
+    _wb_tty "\n  \033[90mFull log: $_WB_LOG\033[0m\n\n"
+    exit 1
+}
+
+_wb_err(){ local rc=$?; [[ $rc -eq 0 || -z "$_WB_PHASE" ]] && return; _phase_fail; }
+trap '_wb_err' ERR
+
+spin_start(){ :; }
+spin_stop() { :; }
+spin_fail() { echo "WARN: $*"; }
+
+_wb_tty '\n  \033[1;36m⬡  WINBOX\033[0m\n\n'
+
 
 # ════════════════════════════════════════════════════════════════
 #  CLI ARGUMENT PARSER
@@ -58,6 +122,9 @@ MONITOR_MODE=0     # --monitor (interactive QMP)
 DELETE_BUILD_MODE=0  # --delete-build: xoá toàn bộ QEMU build
 USE_HTTP_BACKEND=0  # --http-img: bật HTTP backend (không tải file)
 SAFE_DOWNLOAD=0   # --safe-download: tải theo chunks 900MB (cho môi trường giới hạn)
+ISO_MODE=0        # --iso: boot từ ISO thay vì tải Windows image
+ISO_WIN_URL=""    # URL Windows ISO
+ISO_VIRTIO_URL="" # URL VirtIO ISO (optional)
 
 for _arg in "$@"; do
     case "$_arg" in
@@ -82,8 +149,10 @@ for _arg in "$@"; do
         --delete-build) DELETE_BUILD_MODE=1 ;;
         --port-forward=*|--fwd=*)
             _fwd="${_arg#*=}"; EXTRA_FWDS+=("$_fwd") ;;
+        --iso=*)       ISO_MODE=1; ISO_WIN_URL="${_arg#--iso=}" ;;
+        --virtio=*)    ISO_VIRTIO_URL="${_arg#--virtio=}" ;;
         --help|-h)
-            echo "Usage: bash winv26.sh [OPTIONS]"
+            echo "Usage: bash winbox [OPTIONS]"
             echo ""
             echo "  --auto          Chạy không tương tác (bắt buộc kết hợp với --winXXXX)"
             echo "  --win2012       Windows Server 2012 R2"
@@ -106,6 +175,8 @@ for _arg in "$@"; do
   --safe-download Tải file theo chunks 900MB (cho môi trường giới hạn dung lượng)"
             echo "  --http-img      Dùng QEMU HTTP backend (không tải về)"
             echo "  --delete-build  Xoá toàn bộ QEMU build hiện tại (opt/home/rootless)"
+            echo "  --iso=URL       Boot from Windows ISO (requires --virtio=URL for driver)"
+            echo "  --virtio=URL    VirtIO driver ISO URL (used with --iso)"
             echo ""
             echo "  Nếu QEMU đã có sẵn, script tự động bỏ qua build."
             echo "  Dùng --rebuild để build lại từ đầu."
@@ -228,7 +299,7 @@ if [[ -n "$RESIZE_IMG" ]]; then
     [[ ! -f "$IMG" ]] && { echo -e "${R}✘${W}  Không tìm thấy $IMG"; exit 1; }
     PID_VM=$(cat "$WINVM_PID_FILE" 2>/dev/null || echo "")
     if [[ -n "$PID_VM" ]] && kill -0 "$PID_VM" 2>/dev/null; then
-        echo -e "${R}✘${W}  VM đang chạy — phải stop trước: bash winv26.sh --stop --id=$INSTANCE_ID"; exit 1
+        echo -e "${R}✘${W}  VM đang chạy — phải stop trước: bash winbox --stop --id=$INSTANCE_ID"; exit 1
     fi
     echo -e "${B}ℹ${W}  Resize $IMG += $RESIZE_IMG..."
     qemu-img resize "$IMG" "$RESIZE_IMG" && echo -e "${G}✔${W} Resize xong: $IMG $(qemu-img info "$IMG" | grep "virtual size")"
@@ -282,7 +353,7 @@ if [[ "$DELETE_BUILD_MODE" == "1" ]]; then
     else
         echo -e "${Y}⚠️  Không tìm thấy build nào để xoá${W}"
     fi
-    echo -e "${B}ℹ${W}  Chạy lại script để build mới: bash winv26.sh --rebuild"
+    echo -e "${B}ℹ${W}  Chạy lại script để build mới: bash winbox --rebuild"
     echo -e "${C}══════════════════════════════════════${W}"
     exit 0
 fi
@@ -1248,37 +1319,56 @@ with lzma.open('qemu-11.0.0.tar.xz') as f:
     export PKG_CONFIG_PATH="${PKG_CONFIG_PATH%:}"
     echo -e "${B}ℹ${W}  PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
 
-    # ── Ensure pkg-config binary is available (required by meson) ──
-    if ! command -v pkg-config &>/dev/null && ! command -v pkgconf &>/dev/null; then
-        echo -e "${Y}⚠${W}  pkg-config không có — thử cài..."
+    # ── Ensure pkg-config binary actually WORKS (not just exists) ──
+    _pkgcfg_works() {
+        local _pc
+        for _pc in \
+            "${PKG_CONFIG:-}" \
+            "$PREFIX/bin/pkg-config" \
+            "$(command -v pkg-config 2>/dev/null || true)" \
+            "$(command -v pkgconf 2>/dev/null || true)"; do
+            [[ -z "$_pc" || ! -x "$_pc" ]] && continue
+            if "$_pc" --version &>/dev/null; then
+                export PKG_CONFIG="$_pc"
+                return 0
+            fi
+        done
+        return 1
+    }
+
+    if ! _pkgcfg_works; then
+        echo -e "${Y}⚠${W}  pkg-config không có hoặc không chạy được — build từ source..."
         # 1. Conda (thường có trong JupyterHub)
         if command -v conda &>/dev/null; then
-            conda install -y -q -c conda-forge pkg-config > /tmp/pkgconfig-conda.log 2>&1                 && echo -e "${G}✔${W} pkg-config từ conda"                 || echo -e "${Y}⚠${W}  conda install pkg-config thất bại"
+            conda install -y -q -c conda-forge pkg-config > /tmp/pkgconfig-conda.log 2>&1 \
+                && echo -e "${G}✔${W} pkg-config từ conda-forge" \
+                || echo -e "${Y}⚠${W}  conda install pkg-config thất bại"
         fi
-        # 2. Build từ source nếu vẫn chưa có
-        if ! command -v pkg-config &>/dev/null; then
-            echo -e "${B}ℹ${W}  Build pkgconf 2.2.0 từ source (~30s)..."
+        # 2. Build pkg-config 0.29.2 --with-internal-glib (self-contained, zero deps)
+        if ! _pkgcfg_works; then
+            echo -e "${B}ℹ${W}  Build pkg-config 0.29.2 từ source (self-contained)..."
             (cd "$BUILD" \
-                && wget -q "https://github.com/pkgconf/pkgconf/releases/download/pkgconf-2.2.0/pkgconf-2.2.0.tar.xz" \
-                       -O pkgconf.tar.xz 2>/dev/null \
-                && tar xJf pkgconf.tar.xz 2>/dev/null \
-                && cd pkgconf-2.2.0 \
-                && ./configure --prefix="$PREFIX" --disable-dependency-tracking \
-                       --with-pkg-config-dir="$PREFIX/lib/pkgconfig:$PREFIX/lib64/pkgconfig" \
+                && wget -q "https://pkgconfig.freedesktop.org/releases/pkg-config-0.29.2.tar.gz" \
+                       -O pkg-config.tar.gz 2>/dev/null \
+                && tar xzf pkg-config.tar.gz 2>/dev/null \
+                && cd pkg-config-0.29.2 \
+                && CC="$CC_PLAIN" ./configure \
+                       --prefix="$PREFIX" \
+                       --with-internal-glib \
+                       --disable-host-tool \
+                       --disable-dependency-tracking \
                        > /tmp/pkgconfig-build.log 2>&1 \
-                && ${MAKE:-make} -j"$(nproc)" >> /tmp/pkgconfig-build.log 2>&1 \
-                && ${MAKE:-make} install    >> /tmp/pkgconfig-build.log 2>&1 \
-                && ln -sf "$PREFIX/bin/pkgconf" "$PREFIX/bin/pkg-config" 2>/dev/null) \
-                && echo -e "${G}✔${W} pkgconf built from source → $PREFIX/bin" \
-                || echo -e "${Y}⚠${W}  Build pkgconf thất bại — xem /tmp/pkgconfig-build.log"
+                && CC="$CC_PLAIN" ${MAKE:-make} -j"$(nproc)" >> /tmp/pkgconfig-build.log 2>&1 \
+                && ${MAKE:-make} install >> /tmp/pkgconfig-build.log 2>&1) \
+                && echo -e "${G}✔${W} pkg-config 0.29.2 (--with-internal-glib) → $PREFIX/bin" \
+                || echo -e "${Y}⚠${W}  Build pkg-config thất bại — xem /tmp/pkgconfig-build.log"
         fi
     fi
-    if command -v pkg-config &>/dev/null; then
-        hash -r 2>/dev/null || true          # flush bash cache so new binary is found
-        export PKG_CONFIG="$(command -v pkg-config)"
-        echo -e "${G}✔${W} pkg-config: $PKG_CONFIG"
+
+    if _pkgcfg_works; then
+        echo -e "${G}✔${W} pkg-config: $PKG_CONFIG ($("$PKG_CONFIG" --version))"
     else
-        echo -e "${Y}⚠${W}  pkg-config vẫn không tìm thấy — QEMU configure có thể thất bại"
+        echo -e "${Y}⚠${W}  pkg-config vẫn không chạy được — QEMU configure có thể thất bại"
         export PKG_CONFIG=""
     fi
 
@@ -1507,6 +1597,10 @@ _wait_parallel_download() {
 ORIGINAL_DIR="$(pwd)"
 export ORIGINAL_DIR
 _detect_apt
+
+# ── Phase 1 ─────────────────────────────────────────────────────
+_phase_begin "Processing"
+
 _detect_kvm   # ← chạy KVM detection ngay sau apt detection
 
 # ═══════════════════════════════════════════════════════════════
@@ -1775,9 +1869,41 @@ with lzma.open('glib-2.76.6.tar.xz') as f:
         if [[ ! -f ~/qemu-env/bin/activate ]]; then
             if command -v python3 >/dev/null 2>&1; then
                 echo -ne "${B}◜${W} Tạo Python venv..."
-                python3 -m venv ~/qemu-env > /tmp/venv-create.log 2>&1
-                if [[ $? -eq 0 ]]; then echo -e "\r${G}✔${W} Python venv đã tạo          "
-                else echo -e "\r${R}✘${W} Tạo venv thất bại:"; cat /tmp/venv-create.log; exit 1; fi
+                local _venv_rc=0
+                python3 -m venv ~/qemu-env > /tmp/venv-create.log 2>&1 || _venv_rc=$?
+
+                if [[ $_venv_rc -ne 0 ]]; then
+                    # Thử cài python3.X-venv version-specific (cần thiết trên Debian/Colab)
+                    local _pyver
+                    _pyver=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3")
+                    echo -e "\r${Y}⚠${W}  venv fail — thử cài python${_pyver}-venv..."
+                    ${APT_CMD:-apt-get} install -y -qq "python${_pyver}-venv" >/dev/null 2>&1 || true
+                    python3 -m venv ~/qemu-env >> /tmp/venv-create.log 2>&1 || _venv_rc=$?
+                fi
+
+                if [[ $_venv_rc -ne 0 ]]; then
+                    # Fallback: --system-site-packages (kế thừa packages hệ thống)
+                    echo -e "${Y}⚠${W}  Thử venv --system-site-packages..."
+                    rm -rf ~/qemu-env
+                    python3 -m venv --system-site-packages ~/qemu-env >> /tmp/venv-create.log 2>&1 || _venv_rc=$?
+                fi
+
+                if [[ $_venv_rc -ne 0 ]]; then
+                    # Fallback cuối: virtualenv
+                    echo -e "${Y}⚠${W}  Thử virtualenv..."
+                    python3 -m pip install -q virtualenv --break-system-packages 2>/dev/null || \
+                        python3 -m pip install -q virtualenv 2>/dev/null || true
+                    rm -rf ~/qemu-env
+                    python3 -m virtualenv ~/qemu-env >> /tmp/venv-create.log 2>&1 || _venv_rc=$?
+                fi
+
+                if [[ $_venv_rc -eq 0 ]]; then
+                    echo -e "\r${G}✔${W} Python venv đã tạo          "
+                else
+                    echo -e "\r${R}✘${W} Tạo venv thất bại — log:"
+                    tail -20 /tmp/venv-create.log
+                    exit 1
+                fi
             else
                 echo -e "${R}✘${W} python3 không có — không tạo được venv"; exit 1
             fi
@@ -2099,6 +2225,11 @@ esac
 #  CHỌN PHIÊN BẢN WINDOWS
 # ════════════════════════════════════════════════════════════════
 echo ""
+
+_phase_end
+# ── Phase 2 ─────────────────────────────────────────────────────
+_phase_begin "Downloading"
+
 if [[ -n "${win_choice:-}" ]]; then
     echo -e "${G}🤖 Dùng image đã chọn trước: ${WIN_NAME:-Windows image}${W}"
 elif [[ "$AUTO_MODE" == "1" && -n "$AUTO_WIN" ]]; then
@@ -2194,10 +2325,20 @@ if [[ "$AUTO_MODE" == "1" ]]; then
     echo -e "${G}🤖 AUTO MODE — disk extend: 0GB (bỏ qua resize)${W}"
 else
     extra_gb=""
-    read -rp "📦 Mở rộng đĩa thêm bao nhiêu GB (default 20)? " extra_gb
-    # Lọc bỏ escape codes/ký tự lạ từ terminal (tmux, SSH)
-    extra_gb=$(echo "${extra_gb:-20}" | tr -cd '0-9')
+    # Suspend spinner, ask trực tiếp trên terminal
+    if [[ -n "${_WB_SPIN_PID:-}" ]]; then
+        kill "$_WB_SPIN_PID" 2>/dev/null; wait "$_WB_SPIN_PID" 2>/dev/null || true
+        _WB_SPIN_PID=""
+        printf "\r%${COLUMNS:-80}s\r" "" >/dev/tty
+    fi
+    printf "📦 Thêm dung lượng đĩa (GB, Enter=20, 0=bỏ qua): " >/dev/tty
+    IFS= read -r _gb_raw </dev/tty
+    extra_gb=$(printf '%s' "${_gb_raw}" | tr -cd '0-9')
     extra_gb="${extra_gb:-20}"
+    # Restart spinner
+    if [[ -n "${_WB_PHASE:-}" ]]; then
+        _wb_spin_loop "$_WB_PHASE" & _WB_SPIN_PID=$!
+    fi
 fi
 
 if [[ "$extra_gb" -gt 0 ]]; then
@@ -2431,7 +2572,7 @@ if [[ "$KVM_AVAILABLE" == "1" ]]; then
 
     QEMU_CMD=(
         ${QEMU_BIN:-qemu-system-x86_64}
-        -machine q35,hpet=off,accel=kvm
+        -machine q35,hpet=off
         $CPU_OPT
         -smp "$cpu_core"
         -m "${ram_size}G"
@@ -2617,6 +2758,11 @@ if [[ -n "$LAUNCH_PREFIX" ]]; then
 else
     nohup "${QEMU_CMD[@]}" >> "$QEMU_LOG" 2>&1 &
 fi
+
+_phase_end
+# ── Phase 3 ─────────────────────────────────────────────────────
+_phase_begin "Launching"
+
 QEMU_PID=$!
 echo "$QEMU_PID" > "$WINVM_PID_FILE"
 # Write state file for --status
@@ -2989,6 +3135,7 @@ else
     echo -e "⚡ Acceleration : ${Y}TCG (software) | TB cache: ${TCG_TB_MB:-?}MB${W}"
     echo -e "🧠 CPU Model    : ${B}${cpu_host:-unknown}${W}"
 fi
+_phase_end
 echo -e "${C}──────────────────────────────────────────────${W}"
 if [[ -n "$PUBLIC" ]]; then
     echo -e "📡 RDP Address  : ${G}${PUBLIC}${W}"
@@ -3016,3 +3163,131 @@ echo -e "${C}══════════════════════�
 echo -e "${G}🟢 Status       : RUNNING (PID: $QEMU_PID)${W}"
 echo    "⏱  GUI Mode     : Headless / RDP"
 echo -e "${C}══════════════════════════════════════════════${W}"
+
+_iso_mode_run() {
+    # ── Phase 1: Processing (ensure QEMU with VNC support) ─────
+    _phase_begin "Processing"
+    AUTO_BUILD="${AUTO_BUILD:-}"
+    # Check VNC support in existing QEMU
+    local _qemu_ok=0
+    for _q in "$HOME/qemu-static/bin/qemu-system-x86_64" \
+              "$HOME/qemu-optimized/bin/qemu-system-x86_64" \
+              "/opt/qemu-optimized/bin/qemu-system-x86_64" \
+              "/usr/bin/qemu-system-x86_64" \
+              "$(command -v qemu-system-x86_64 2>/dev/null || true)"; do
+        [[ -x "$_q" ]] || continue
+        if "$_q" --help 2>&1 | grep -q "\-display"; then
+            QEMU_BIN="$_q"; _qemu_ok=1; break
+        fi
+    done
+    if [[ "$_qemu_ok" == "0" || "$AUTO_BUILD" == "yes" ]]; then
+        echo "ISO mode: building QEMU (VNC enabled)..."
+        AUTO_BUILD="yes"
+        # The main build logic sets QEMU_BIN — run it via the existing path
+        if [[ "$(id -u)" == "0" ]] && command -v apt-get &>/dev/null; then
+            _apt_build 2>&1 || true
+        else
+            _rootless_build 2>&1 || true
+        fi
+    else
+        echo "ISO mode: using existing QEMU: $QEMU_BIN"
+    fi
+    _phase_end
+
+    # ── Phase 2: Downloading ISOs ──────────────────────────────
+    local _iso_dir="$HOME/.cache/winbox-iso"
+    mkdir -p "$_iso_dir"
+    cd "$_iso_dir"
+
+    _phase_begin "Downloading"
+    echo "Downloading Windows ISO → win.iso"
+    if [[ ! -f win.iso ]]; then
+        wget -q --no-check-certificate -O win.iso "$ISO_WIN_URL" \
+            || curl -fsSL -o win.iso "$ISO_WIN_URL" \
+            || { echo "ERROR: failed to download Windows ISO"; exit 1; }
+    else
+        echo "win.iso already exists — skip"
+    fi
+    if [[ -n "$ISO_VIRTIO_URL" ]]; then
+        echo "Downloading VirtIO ISO → virtio.iso"
+        if [[ ! -f virtio.iso ]]; then
+            wget -q --no-check-certificate -O virtio.iso "$ISO_VIRTIO_URL" \
+                || curl -fsSL -o virtio.iso "$ISO_VIRTIO_URL" \
+                || { echo "ERROR: failed to download VirtIO ISO"; exit 1; }
+        else
+            echo "virtio.iso already exists — skip"
+        fi
+    fi
+    _phase_end
+
+    # ── Ask disk size (interactive, English) ───────────────────
+    local _disk_gb="60"
+    printf "\nDisk size in GB [default 60]: " >/dev/tty
+    IFS= read -r _disk_raw </dev/tty
+    _disk_raw=$(printf '%s' "${_disk_raw}" | tr -cd '0-9')
+    [[ -n "$_disk_raw" ]] && _disk_gb="$_disk_raw"
+    printf "Creating disk.qcow2 (%sG)...\n" "$_disk_gb" >/dev/tty
+    "$QEMU_BIN" 2>/dev/null; true   # ensure QEMU_BIN is set
+    qemu-img create -f qcow2 "$_iso_dir/disk.qcow2" "${_disk_gb}G" >/dev/tty 2>&1
+
+    # ── Phase 3: Launching ─────────────────────────────────────
+    _phase_begin "Launching"
+    local _has_virtio_iso=0
+    [[ -f "$_iso_dir/virtio.iso" && -n "$ISO_VIRTIO_URL" ]] && _has_virtio_iso=1
+
+    local _launch_cmd=(
+        "$QEMU_BIN"
+        -machine type=q35
+        -cpu qemu64
+        -smp 2,sockets=1,cores=2,threads=1
+        -m 4G
+        -accel tcg,thread=multi,tb-size=3097152
+        -object iothread,id=io1
+        -drive file="$_iso_dir/disk.qcow2",if=none,id=disk0,format=qcow2,cache=unsafe,aio=threads,discard=on
+        -device virtio-blk-pci,drive=disk0,iothread=io1,num-queues=1,queue-size=128
+        -cdrom "$_iso_dir/win.iso"
+    )
+    if [[ "$_has_virtio_iso" == "1" ]]; then
+        _launch_cmd+=(
+            -drive file="$_iso_dir/virtio.iso",media=cdrom,if=none,id=cdvirtio
+            -device ide-cd,drive=cdvirtio
+        )
+    fi
+    _launch_cmd+=(
+        -device virtio-gpu-pci
+        -device qemu-xhci,id=xhci
+        -device usb-tablet,bus=xhci.0
+        -device usb-kbd,bus=xhci.0
+        -netdev user,id=n0,hostfwd=tcp::3389-:3389
+        -device virtio-net-pci,netdev=n0
+        -display vnc=:0
+        -boot order=c,menu=on
+        -daemonize
+    )
+    echo "Launching ISO VM..."
+    "${_launch_cmd[@]}"
+    _phase_end
+
+    # ── Summary ────────────────────────────────────────────────
+    echo ""
+    echo "  ────────────────────────────────────────────"
+    echo "  💿  ISO Boot  :  VM is running"
+    echo "  🖥  VNC       :  localhost:5900"
+    echo "              →  vncviewer localhost:5900"
+    echo "              →  TigerVNC / RealVNC / any VNC client"
+    echo "  🌐  RDP port  :  localhost:3389  (after Windows setup)"
+    echo "  💾  Disk      :  $_iso_dir/disk.qcow2  (${_disk_gb}G)"
+    echo "  ────────────────────────────────────────────"
+}
+
+# ── ISO mode early exit ────────────────────────────────────────
+if [[ "$ISO_MODE" == "1" ]]; then
+    if [[ -z "$ISO_WIN_URL" ]]; then
+        echo "Error: --iso=<url> requires a Windows ISO URL" >&2
+        exit 1
+    fi
+    _iso_mode_run
+    exit 0
+fi
+
+_phase_begin "Processing"
